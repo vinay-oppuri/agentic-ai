@@ -1,5 +1,29 @@
-import { pgTable, text, timestamp, boolean, uuid } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, jsonb, timestamp, boolean, uuid, varchar } from "drizzle-orm/pg-core";
 import z from "zod";
+
+export const chats = pgTable("chats", {
+  id: serial("id").primaryKey(),
+  user_id: text("user_id").notNull(),
+  query: text("query").notNull(),
+  response: text("response").notNull(),
+  created_at: timestamp("created_at").defaultNow(),
+});
+
+export const chat_memory = pgTable("chat_memory", {
+  id: serial("id").primaryKey(),
+  user_id: text("user_id").notNull(),
+  memory: jsonb("memory").default([]),
+  updated_at: timestamp("updated_at").defaultNow(),
+});
+
+export const reports = pgTable("reports", {
+  id: serial("id").primaryKey(),
+  idea: text("idea").notNull(),
+  result_json: jsonb("result_json").notNull(),
+  report_md: text("report_md").notNull(),
+  created_at: timestamp("created_at").defaultNow(),
+});
+
 
 export const signUpFormSchema = z.object({
   name: z.string().min(1, {message: "Nmae is required."}),

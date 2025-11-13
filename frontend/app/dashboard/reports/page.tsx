@@ -1,154 +1,210 @@
-"use client";
+'use client';
 
-import { useEffect, useState } from "react";
-import axios from "axios";
-import { motion, AnimatePresence } from "framer-motion";
+import { useEffect, useState } from 'react';
+import axios from 'axios';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
-import {
-  Accordion,
-  AccordionItem,
-  AccordionTrigger,
-  AccordionContent,
-} from "@/components/ui/accordion";
-import { Loader2 } from "lucide-react";
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { Loader2, FileText, X, Calendar } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 
-interface ResearchReport {
-  id: string;
+interface Report {
+  id: number;
   idea: string;
-  marketAnalysis: string;
-  competitorAnalysis: string;
-  keyInsights: string;
-  generatedAt: string;
-  userId: string;
+  report_md: string;
+  created_at: string;
 }
 
 export default function ReportsPage() {
-  const [reports, setReports] = useState<ResearchReport[]>([]);
+  const [reports, setReports] = useState<Report[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selectedReport, setSelectedReport] = useState<ResearchReport | null>(null);
+  const [selected, setSelected] = useState<Report | null>(null);
 
+  // ✅ Fetch all reports from Neon DB
   useEffect(() => {
-    async function fetchReports() {
+    const fetchReports = async () => {
       try {
-        const res = await axios.get("/api/reports");
+        const res = await axios.get('http://localhost:8000/api/get-reports');
         setReports(res.data);
-      } catch (error) {
-        console.error(error);
+      } catch (err) {
+        console.error('❌ Error loading reports:', err);
       } finally {
         setLoading(false);
       }
-    }
+    };
     fetchReports();
   }, []);
 
-  if (loading)
-    return (
-      <div className="flex items-center justify-center min-h-[70vh]">
-        <Loader2 className="animate-spin w-8 h-8 text-gray-500" />
-      </div>
-    );
+   useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSelected(null);
+    };
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, []);
 
-  if (reports.length === 0)
+  // ✅ Markdown Rendering Styles
+  const markdownComponents = {
+    h1: ({ node, ...props }: any) => (
+      <h1
+        className="text-4xl font-extrabold mt-10 mb-6 text-purple-300 border-b border-purple-800/30 pb-2"
+        {...props}
+      />
+    ),
+    h2: ({ node, ...props }: any) => (
+      <h2
+        className="text-3xl font-bold mt-8 mb-4 text-purple-400 border-b border-purple-800/20 pb-1"
+        {...props}
+      />
+    ),
+    h3: ({ node, ...props }: any) => (
+      <h3
+        className="text-2xl font-semibold mt-6 mb-3 text-pink-300"
+        {...props}
+      />
+    ),
+    p: ({ node, ...props }: any) => (
+      <p className="text-gray-300 text-base mb-4 leading-relaxed" {...props} />
+    ),
+    ul: ({ node, ordered, ...props }: any) => (
+      <ul
+        className="list-disc ml-6 space-y-2 marker:text-purple-400"
+        {...props}
+      />
+    ),
+    ol: ({ node, ...props }: any) => (
+      <ol
+        className="list-decimal ml-6 space-y-2 marker:text-pink-400"
+        {...props}
+      />
+    ),
+    li: ({ node, ...props }: any) => (
+      <li className="text-gray-300 leading-relaxed" {...props} />
+    ),
+    a: ({ node, ...props }: any) => (
+      <a
+        className="text-blue-400 underline hover:text-blue-300 transition-colors"
+        target="_blank"
+        rel="noopener noreferrer"
+        {...props}
+      />
+    ),
+    blockquote: ({ node, ...props }: any) => (
+      <blockquote
+        className="border-l-4 border-purple-600 pl-4 italic text-gray-400 my-4"
+        {...props}
+      />
+    ),
+    code: ({ node, inline, ...props }: any) =>
+      inline ? (
+        <code
+          className="bg-gray-800 text-purple-300 px-1.5 py-0.5 rounded text-sm font-mono"
+          {...props}
+        />
+      ) : (
+        <pre
+          className="bg-gray-900 text-purple-200 p-3 rounded-lg overflow-x-auto my-4 font-mono text-sm"
+          {...props}
+        />
+      ),
+  };
+
+  // ✅ Loading State
+  if (loading) {
     return (
-      <div className="text-center mt-20 text-gray-600 dark:text-gray-400 text-lg">
-        No research reports found yet.
+      <div className="flex justify-center items-center h-screen text-gray-400 text-lg font-medium">
+        <Loader2 className="animate-spin w-6 h-6 mr-2 text-purple-400" />
+        Loading Reports...
       </div>
     );
+  }
 
   return (
-    <div className="max-w-7xl mx-auto">
-      <h1 className="text-4xl font-bold mb-16 text-center bg-linear-to-r from-indigo-500 via-purple-500 to-pink-500 bg-clip-text text-transparent">
-        Your Research Reports
-      </h1>
+    <div className="p-6 sm:px-10 sm:py-8 text-white space-y-8">
+      <Card className="bg-black/30 backdrop-blur-lg border border-white/10 rounded-2xl shadow-2xl">
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <FileText className="w-8 h-8 text-purple-400" />
+              <CardTitle className="text-3xl font-extrabold bg-linear-to-r from-purple-400 to-pink-300 bg-clip-text text-transparent">
+                Saved Reports
+              </CardTitle>
+            </div>
+            <span className="text-gray-400 text-sm">
+              Total: {reports.length}
+            </span>
+          </div>
+        </CardHeader>
 
-      {/* Reports Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-        {reports.map((report, idx) => (
-          <motion.div
-            key={report.id}
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: idx * 0.05 }}
-            className="group p-6 rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-md hover:shadow-xl cursor-pointer transition"
-            onClick={() => setSelectedReport(report)}
-          >
-            <h2 className="text-xl font-semibold mb-2 text-gray-900 dark:text-gray-100 group-hover:text-indigo-500 transition">
-              {report.idea}
-            </h2>
-            <p className="text-sm text-gray-500 mb-3">
-              Generated on {new Date(report.generatedAt).toLocaleDateString()}
-            </p>
-            <p className="text-gray-700 dark:text-gray-300 line-clamp-3">
-              {report.keyInsights.length > 100
-                ? report.keyInsights.slice(0, 100) + "..."
-                : report.keyInsights}
-            </p>
-          </motion.div>
-        ))}
-      </div>
-
-      {/* Popup Dialog */}
-      <AnimatePresence>
-        {selectedReport && (
-          <Dialog open={!!selectedReport} onOpenChange={() => setSelectedReport(null)}>
-            <DialogContent className="min-w-4xl bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl">
-              <DialogHeader>
-                <DialogTitle className="text-2xl font-bold text-center text-indigo-600">
-                  {selectedReport.idea}
-                </DialogTitle>
-                <DialogDescription className="text-center text-muted-foreground text-sm">
-                  Generated on{" "}
-                  {new Date(selectedReport.generatedAt).toLocaleString()}
-                </DialogDescription>
-              </DialogHeader>
-
-              <Accordion type="single" collapsible defaultValue="market" className="flex flex-col w-full mt-4 gap-3">
-                <AccordionItem
-                  value="market"
-                  className="border border-gray-200 dark:border-gray-700 rounded-xl px-4"
+        <CardContent className="space-y-3">
+          {reports.length === 0 ? (
+            <p className="text-gray-400 text-center">No reports found.</p>
+          ) : (
+            reports.map((r) => (
+              <div
+                key={r.id}
+                className="flex justify-between items-center bg-black/20 border border-white/10 p-4 rounded-lg hover:bg-purple-900/10 transition-all"
+              >
+                <div>
+                  <h3 className="text-lg font-semibold text-purple-300">
+                    {r.idea}
+                  </h3>
+                  <p className="text-sm text-gray-400 flex items-center gap-1 mt-1">
+                    <Calendar className="w-4 h-4 text-gray-500" />
+                    {new Date(r.created_at).toLocaleString()}
+                  </p>
+                </div>
+                <Button
+                  onClick={() => setSelected(r)}
+                  className="bg-purple-600 hover:bg-purple-700 text-white font-semibold"
                 >
-                  <AccordionTrigger className="text-lg font-medium">
-                    Market Analysis
-                  </AccordionTrigger>
-                  <AccordionContent className="text-gray-700 dark:text-gray-300 text-sm leading-relaxed">
-                    {selectedReport.marketAnalysis}
-                  </AccordionContent>
-                </AccordionItem>
+                  View Report
+                </Button>
+              </div>
+            ))
+          )}
+        </CardContent>
+      </Card>
 
-                <AccordionItem
-                  value="competitor"
-                  className="border border-gray-200 dark:border-gray-700 rounded-xl px-4"
-                >
-                  <AccordionTrigger className="text-lg font-medium">
-                    Competitor Analysis
-                  </AccordionTrigger>
-                  <AccordionContent className="text-gray-700 dark:text-gray-300 text-sm leading-relaxed">
-                    {selectedReport.competitorAnalysis}
-                  </AccordionContent>
-                </AccordionItem>
+      {/* Modal Popup for Full Report */}
+      {selected && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex justify-center items-center p-6">
+          <div className="relative bg-gray-900 border border-white/10 rounded-2xl shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-y-auto p-6">
+            {/* Close Button */}
+            <button
+              onClick={() => setSelected(null)}
+              className="absolute top-3 right-3 text-gray-400 hover:text-white transition"
+            >
+              <X className="w-6 h-6" />
+            </button>
 
-                <AccordionItem
-                  value="insights"
-                  className="border border-gray-200 dark:border-gray-700 rounded-xl px-4"
-                >
-                  <AccordionTrigger className="text-lg font-medium">
-                    Key Insights
-                  </AccordionTrigger>
-                  <AccordionContent className="text-gray-700 dark:text-gray-300 text-sm leading-relaxed">
-                    {selectedReport.keyInsights}
-                  </AccordionContent>
-                </AccordionItem>
-              </Accordion>
-            </DialogContent>
-          </Dialog>
-        )}
-      </AnimatePresence>
+            {/* Header */}
+            <div className="mb-4">
+              <h2 className="text-3xl font-bold text-purple-300 mb-1">
+                {selected.idea}
+              </h2>
+              <p className="text-sm text-gray-400">
+                Generated on: {new Date(selected.created_at).toLocaleString()}
+              </p>
+            </div>
+
+            {/* Markdown Content */}
+            <div className="prose prose-invert max-w-none leading-relaxed text-gray-300">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={markdownComponents}
+              >
+                {selected.report_md || '*No content available.*'}
+              </ReactMarkdown>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
