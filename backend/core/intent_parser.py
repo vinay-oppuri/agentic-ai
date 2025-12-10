@@ -1,141 +1,160 @@
 """
-intent_parser.py - python -m core.intent_parser
+intent_parser.py
 ----------------
-Extracts structured intent and contextual metadata from user startup ideas or queries.
-Acts as the first step in the agentic pipeline before Dynamic Task Planner.
+Extracts structured intent & semantic metadata from user startup queries.
+Uses Google GenAI (native API) + rule-based fallback.
 """
-import os
+
 import re
-from typing import Dict, Any
+import json
+from typing import Any, Dict
+
 from loguru import logger
-from langchain_core.prompts import PromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-from app.config import config
+from google import genai
+from app.config import settings
+
+
+client = genai.Client(api_key=settings.google_api_key)
 
 
 class IntentParser:
     """
     Intent Parser Agent
     -------------------
-    Extracts:
-      - domain / industry
-      - target audience
-      - business model
-      - tech keywords
-      - competitor mentions
-      - intent type (idea, compare, trend, tech, etc.)
+    Extracts structured metadata such as:
+        - industry
+        - target audience
+        - business model
+        - tech keywords
+        - competitor names
+        - intent type (idea, compare, trend, tech, etc.)
+        - problem & solution summary
+        - data needs
+        - which agents to activate
+        - complexity level
     """
 
     def __init__(self, use_llm: bool = True):
         self.use_llm = use_llm
-        self.llm = None
-        if use_llm and config.GEMINI_API_KEY1:
-            try:
-                os.environ["GOOGLE_API_KEY"] = config.GEMINI_API_KEY1
-                self.llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.3,
-    max_tokens=None,
-    timeout=None,
-    max_retries=2,
-    # other params...
-)
-            except Exception as e:
-                logger.warning(f" LLM initialization failed: {e}. Falling back to regex parser.")
-                self.use_llm = False
 
-        # Define the fallback keywords for rule-based extraction
+        # Fallback rules
         self.domains = [
-            "health", "education", "finance", "travel", "food", "fitness", "pet", "real estate",
-            "transportation", "ai", "mental health", "agriculture", "gaming", "retail", "sustainability"
+            "health", "education", "finance", "travel", "food",
+            "fitness", "pet", "real estate", "transportation",
+            "ai", "mental health", "agriculture", "gaming",
+            "retail", "sustainability"
         ]
+
         self.tech_terms = [
-            "AI", "machine learning", "blockchain", "NLP", "data analytics", "AR", "VR",
-            "IoT", "chatbot", "LLM", "neural network"
+            "ai", "machine learning", "blockchain", "nlp", "data analytics",
+            "ar", "vr", "iot", "chatbot", "llm", "neural network"
         ]
+
         self.intent_patterns = {
             "compare": r"(compare|vs|difference|better than)",
             "trend": r"(trend|market|growth|statistics)",
             "tech": r"(technology|innovation|research|paper)",
-            "idea": r"(idea|startup|launch|build)",
+            "idea": r"(idea|startup|launch|build)"
         }
 
-    # ------------------------
-    # Public Method
-    # ------------------------
+    # --------------------------------------------------------
+    # Public API
+    # --------------------------------------------------------
     def parse(self, user_input: str) -> Dict[str, Any]:
-        logger.info(f" Parsing intent for: '{user_input}'")
+        logger.info(f"🔍 Parsing intent: {user_input}")
 
-        if self.use_llm and self.llm:
-            return self._parse_with_llm(user_input)
-        else:
-            return self._parse_with_rules(user_input)
+        if self.use_llm:
+            try:
+                return self._parse_with_llm(user_input)
+            except Exception as e:
+                logger.warning(f"⚠️ LLM parsing failed ({e}), falling back to regex rules.")
 
-    # ------------------------
-    # LLM-based Semantic Parsing
-    # ------------------------
-    def _parse_with_llm(self, text: str) -> Dict[str, Any]:
-        prompt = PromptTemplate(
-            input_variables=["query"],
-            # template=(
-            #     "You are an intelligent intent parser for a Startup Research Assistant.\n"
-            #     "Extract key structured data from the user query below.\n\n"
-            #     "User query: {query}\n\n"
-            #     "Return a JSON with the following fields:\n"
-            #     "industry, business_model, target_audience, tech_keywords, competitor_names, intent_type."
-            # ),
-            template = (
-                    "You are an intelligent intent parser for a Startup Research Assistant.\n"
-                    "Extract structured insights from the user query below.\n\n"
-                    "User query: {query}\n\n"
-                    "Return a JSON with the following fields:\n"
-                    "industry, business_model, target_audience, tech_keywords, competitor_names, intent_type,\n"
-                    "problem_statement, solution_summary, data_needs, agent_triggers, complexity_level."
-                )
+        return self._parse_with_rules(user_input)
 
+    # --------------------------------------------------------
+    # LLM PARSER (Google GenAI)
+    # --------------------------------------------------------
+    def _parse_with_llm(self, query: str) -> Dict[str, Any]:
+        prompt = f"""
+You are a top-tier Intent Parsing AI for a Startup Research Assistant.
+
+Analyze the user query below and extract structured metadata.
+
+USER QUERY:
+{query}
+
+RETURN A VALID JSON OBJECT WITH EXACTLY THESE FIELDS:
+
+{{
+  "industry": "...",
+  "business_model": "...",
+  "target_audience": "...",
+  "tech_keywords": ["..."],
+  "competitor_names": ["..."],
+  "intent_type": "...",
+  "problem_statement": "...",
+  "solution_summary": "...",
+  "data_needs": ["..."],
+  "agent_triggers": ["trend_scraper", "competitor_scout", "paper_miner"],
+  "complexity_level": "low | medium | high"
+}}
+
+Ensure the JSON is clean and valid.
+        """
+
+        response = client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt
         )
-        try:
-            response = self.llm.invoke(prompt.format_prompt(query=text).to_string())
-            parsed = self._safe_extract_json(response.content)
-            parsed["raw_query"] = text
-            logger.success(" LLM-based intent parsed successfully.")
-            return parsed
-        except Exception as e:
-            logger.warning(f" LLM parsing failed ({e}), falling back to rule-based.")
-            return self._parse_with_rules(text)
 
-    # ------------------------
-    # Rule-based Fallback Parser
-    # ------------------------
+        text = response.text
+        parsed = self._safe_extract_json(text)
+        parsed["raw_query"] = query
+
+        logger.success("✅ LLM intent parsed successfully.")
+        return parsed
+
+    # --------------------------------------------------------
+    # RULE-BASED FALLBACK PARSER
+    # --------------------------------------------------------
     def _parse_with_rules(self, text: str) -> Dict[str, Any]:
+        logger.info("🧩 Using rule-based parser")
+
         text_lower = text.lower()
-        extracted_domain = next((d for d in self.domains if d in text_lower), "general")
-        extracted_tech = [t for t in self.tech_terms if t.lower() in text_lower]
-        extracted_intent = next(
-            (intent for intent, pattern in self.intent_patterns.items() if re.search(pattern, text_lower)),
-            "idea",
+        industry = next((d for d in self.domains if d in text_lower), "general")
+
+        tech = [t for t in self.tech_terms if t.lower() in text_lower]
+
+        intent_type = next(
+            (name for name, pattern in self.intent_patterns.items()
+             if re.search(pattern, text_lower)),
+            "idea"
         )
 
         competitors = re.findall(r"[A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?", text)
-        if len(competitors) <= 1:
-            competitors = []
+        competitors = competitors if len(competitors) > 1 else []
 
-        result = {
-            "industry": extracted_domain,
+        parsed = {
+            "industry": industry,
             "business_model": self._infer_business_model(text_lower),
             "target_audience": self._infer_audience(text_lower),
-            "tech_keywords": extracted_tech,
+            "tech_keywords": tech,
             "competitor_names": competitors,
-            "intent_type": extracted_intent,
-            "raw_query": text,
+            "intent_type": intent_type,
+            "problem_statement": text,
+            "solution_summary": "",
+            "data_needs": [],
+            "agent_triggers": ["trend_scraper", "competitor_scout", "tech_paper_miner"],
+            "complexity_level": "medium",
+            "raw_query": text
         }
 
-        logger.success(" Rule-based intent parsed successfully.")
-        return result
+        logger.success("✅ Rule-based intent parsed.")
+        return parsed
 
-    # ------------------------
-    # Helper Methods
-    # ------------------------
+    # --------------------------------------------------------
+    # Helper functions
+    # --------------------------------------------------------
     def _infer_business_model(self, text: str) -> str:
         if "platform" in text:
             return "Platform"
@@ -152,28 +171,40 @@ class IntentParser:
     def _infer_audience(self, text: str) -> str:
         if "student" in text:
             return "Students"
+        if "developer" in text or "engineer" in text:
+            return "Developers"
         if "business" in text or "startup" in text:
             return "Businesses"
-        if "pet" in text:
-            return "Pet Owners"
         if "doctor" in text or "patient" in text:
             return "Healthcare Users"
         return "General Audience"
 
     def _safe_extract_json(self, text: str) -> Dict[str, Any]:
-        import json, re
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
             except json.JSONDecodeError:
                 pass
-        return {"industry": None, "business_model": None, "intent_type": "idea"}
+
+        return {
+            "industry": None,
+            "business_model": None,
+            "target_audience": None,
+            "tech_keywords": [],
+            "competitor_names": [],
+            "intent_type": "idea",
+        }
 
 
-# For standalone testing
+# --------------------------------------------------------
+# Standalone CLI test
+# --------------------------------------------------------
 if __name__ == "__main__":
     parser = IntentParser()
-    sample_queries = "github repository analysis tool for developers where user can give repo links and the tool will will have a chatbot type q/a and give insights about code quality, bugs, vulnerabilities, code structure, design patterns used, etc."
-    print("\nInput:", sample_queries)
-    print(parser.parse(sample_queries))
+    q = (
+        "GitHub repository analysis tool for developers where "
+        "user can give repo links and the tool will show insights about "
+        "code quality, vulnerabilities, architecture, etc."
+    )
+    print(parser.parse(q))

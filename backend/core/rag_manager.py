@@ -1,225 +1,157 @@
-import os
-import shutil
+# core/rag_manager.py
+"""
+Neon + pgvector RAG Manager.
+
+- Chunks documents
+- Embeds with Gemini (text-embedding-004)
+- Stores chunks & embeddings in Neon (document_chunks table)
+- Performs vector similarity search with pgvector
+"""
+
 import json
-import time
-import asyncio
+from typing import Any, Dict, List
+
 from loguru import logger
-from typing import List, Dict, Any, Optional
-from dotenv import load_dotenv
+from sqlalchemy import text
 
-from app.config import config
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
-from google import genai 
+from core.llm import embed_texts
+from core.types import Document
+from infra.db import db_execute, db_query
 
 
-load_dotenv()
-if getattr(config, "GEMINI_API_KEY3", None):
-    os.environ["GOOGLE_API_KEY"] = config.GEMINI_API_KEY3
+def _chunk_text(text: str, chunk_size: int = 1500, overlap: int = 150) -> List[str]:
+    """Simple character-based splitter."""
+    chunks: List[str] = []
+    start = 0
+    n = len(text)
+
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunks.append(text[start:end])
+        if end == n:
+            break
+        start = end - overlap
+
+    return chunks
 
 
-class Embedder:
-    def __init__(self):
-        self.model_name = "text-embedding-004"
-        self.client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY_4"))
-
-    async def embed_texts(self, texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> Optional[List[List[float]]]:
-        if not texts:
-            return []
-        retries = 3
-        for attempt in range(retries):
-            try:
-                result = self.client.models.embed_content(
-                    model=self.model_name,
-                    contents=texts,
-                    config=genai.types.EmbedContentConfig(
-                        output_dimensionality=3072,
-                        task_type=task_type
-                    )
-                )
-                return [e.values for e in result.embeddings]
-            except Exception as e:
-                if "RESOURCE_EXHAUSTED" in str(e) and attempt < retries - 1:
-                    logger.warning(f"[Gemini Embedder] Rate limited. Retrying in 10s (attempt {attempt+1})...")
-                    await asyncio.sleep(10)
-                    continue
-                logger.error(f"[Gemini Embedder] Embedding error: {e}")
-                return None
-
-
-class GeminiEmbeddingWrapper:
-    """Wraps the async Embedder into a LangChain-compatible embedding interface."""
-
-    def __init__(self, embedder: "Embedder"):
-        self.embedder = embedder
-
-    def _safe_await(self, coro):
-        """Safely await coroutine whether FastAPI loop is active or not."""
-        import threading
-        import concurrent.futures
-        try:
-            try:
-                loop = asyncio.get_running_loop()
-                if loop.is_running():
-                    # Run coroutine safely in a thread pool to avoid nested event loop issues
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        future = pool.submit(lambda: asyncio.run(coro))
-                        return future.result()
-            except RuntimeError:
-                # No running loop (CLI mode)
-                return asyncio.run(coro)
-        except Exception as e:
-            from loguru import logger
-            logger.error(f"[Embed Wrapper] Await failed: {e}")
-            return None
-
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Embeds multiple documents safely across async/sync contexts."""
-        result = self._safe_await(self.embedder.embed_texts(texts))
-        return result if result else [[] for _ in texts]
-
-    def embed_query(self, text: str) -> List[float]:
-        """Embeds a single query safely."""
-        result = self._safe_await(self.embedder.embed_texts([text]))
-        return result[0] if result else []
+def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure metadata is JSON-serializable and flat-ish."""
+    clean: Dict[str, Any] = {}
+    for k, v in (metadata or {}).items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            clean[k] = v
+        elif isinstance(v, list):
+            clean[k] = ", ".join(map(str, v))
+        elif isinstance(v, dict):
+            clean[k] = json.dumps(v, ensure_ascii=False)
+            # Alternatively: store nested dict as JSON string
+        else:
+            clean[k] = str(v)
+    return clean
 
 
 class VectorStoreManager:
-    def __init__(self, persist_directory: str = "./chroma_db"):
-        self.persist_directory = persist_directory
-        self.embedder = Embedder()
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500,
-            chunk_overlap=150,
-            length_function=len,
-            is_separator_regex=False,
-        )
-        self.db = None
+    """
+    VectorStoreManager for Neon + pgvector.
 
-    def _get_db(self):
-        """Initialize the Chroma client."""
-        if self.db is None:
-            logger.info(f"Initializing vector store client at: {self.persist_directory}")
-            embedding_wrapper = GeminiEmbeddingWrapper(self.embedder)
-            self.db = Chroma(
-                persist_directory=self.persist_directory,
-                embedding_function=embedding_wrapper
-            )
-        return self.db
+    API:
+        await clear_store()
+        await add_documents(documents)
+        await search(query, k=5)
+    """
 
+    async def clear_store(self) -> None:
+        logger.warning("🧹 Clearing document_chunks table...")
+        sql = "TRUNCATE document_chunks RESTART IDENTITY;"
+        await db_execute(sql)
+        logger.info("✅ Vector store cleared.")
 
-    def _embedding_function(self, texts: List[str]) -> List[List[float]]:
-        """Sync wrapper around async embedder call."""
-        try:
-            return asyncio.run(self.embedder.embed_texts(texts))
-        except Exception as e:
-            logger.error(f"Embedding function failed: {e}")
-            return [[] for _ in texts]
-
-    async def add_documents(self, documents: List[Document]):
+    async def add_documents(self, documents: List[Dict[str, Any]]) -> None:
+        """
+        documents: list of dicts with keys:
+            - page_content: str
+            - metadata: dict
+        """
         if not documents:
-            logger.warning("No documents provided to add.")
+            logger.warning("No documents provided to add to vector store.")
             return
 
-        logger.info(f"Received {len(documents)} raw documents. Starting chunking...")
-        chunks = self.text_splitter.split_documents(documents)
-        logger.info(f"Split {len(documents)} documents into {len(chunks)} chunks.")
+        logger.info(f"📄 Received {len(documents)} documents. Chunking & embedding...")
 
-        db = self._get_db()
-        logger.info(f"Adding {len(chunks)} chunks to vector store...")
+        # 1) Build chunks
+        chunks: List[Dict[str, Any]] = []
+        for doc in documents:
+            text = doc.get("page_content") or ""
+            meta = _sanitize_metadata(doc.get("metadata", {}))
+            for chunk in _chunk_text(text):
+                chunks.append({"content": chunk, "metadata": meta})
 
-        BATCH_SIZE = 3
+        logger.info(f"✂️ Split into {len(chunks)} chunks.")
+
+        if not chunks:
+            logger.warning("No chunks produced from documents.")
+            return
+
+        # 2) Embed in batches
+        BATCH_SIZE = 16
         for i in range(0, len(chunks), BATCH_SIZE):
-            batch = chunks[i:i + BATCH_SIZE]
-            for c in batch:
-                c.metadata = self._sanitize_metadata(c.metadata)
+            batch = chunks[i : i + BATCH_SIZE]
+            texts = [c["content"] for c in batch]
+
             try:
-                db.add_documents(batch)
-                logger.info(f"  > Added chunks {i+1}–{i+len(batch)}/{len(chunks)}")
+                embeddings = await embed_texts(texts)
             except Exception as e:
-                logger.warning(f"Embedding batch {i} failed: {e}, retrying after delay...")
-                await asyncio.sleep(15)
+                logger.error(f"Embedding batch {i} failed: {e}")
                 continue
-            await asyncio.sleep(2.5)  # avoid Gemini throttle
 
-        logger.info(f"✅ Successfully added all {len(chunks)} chunks.")
+            # 3) Insert into Neon
+            sql = """
+            INSERT INTO document_chunks (content, metadata, embedding)
+            VALUES (%s, %s, %s)
+            """
 
+            params_list = [
+                (c["content"], json.dumps(c["metadata"]), emb)
+                for c, emb in zip(batch, embeddings)
+            ]
 
-    def search(self, query: str, k: int = 5) -> List[Document]:
-        """Retrieve relevant chunks."""
-        logger.info(f"Searching for: '{query}'...")
-        db = self._get_db()
-        retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": k})
-        results = retriever.invoke(query)
-        logger.info(f"Found {len(results)} relevant chunks.")
-        return results
+            for params in params_list:
+                await db_execute(sql, list(params))
 
-    def clear_store(self):
-        """Wipes the vector store."""
-        logger.warning(f"Clearing vector store at: {self.persist_directory}")
-        self.db = None
-        if os.path.exists(self.persist_directory):
-            shutil.rmtree(self.persist_directory, ignore_errors=True)
-            logger.info("Vector store directory deleted.")
-        logger.info("Vector store cleared.")
+            logger.info(f"  > Stored chunks {i+1}–{i+len(batch)}/{len(chunks)}")
 
+        logger.info("✅ All chunks stored in Neon.")
 
-    @staticmethod
-    def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Ensure all metadata values are flat (str, int, float, bool, None)."""
-        clean_meta = {}
-        for k, v in metadata.items():
-            if isinstance(v, (str, int, float, bool)) or v is None:
-                clean_meta[k] = v
-            elif isinstance(v, list):
-                # Convert list to comma-separated string
-                clean_meta[k] = ", ".join(map(str, v))
-            elif isinstance(v, dict):
-                # Convert dict to a compact string
-                clean_meta[k] = json.dumps(v, ensure_ascii=False)
-            else:
-                # Drop or stringify unknown types
-                clean_meta[k] = str(v)
-        return clean_meta
+    async def search(self, query: str, k: int = 5) -> List[Document]:
+        """
+        Vector similarity search using pgvector <-> operator.
+        Returns a list of core.types.Document.
+        """
+        logger.info(f"🔍 Vector search for: {query!r}")
 
+        [query_emb] = await embed_texts([query])
 
-if __name__ == "__main__":
-    json_input_file = "data/raw_docs/raw_docs.json"
-    documents_to_add = []
+        sql = text(
+            """
+            SELECT content, metadata, embedding <-> :q AS distance
+            FROM document_chunks
+            ORDER BY embedding <-> :q
+            LIMIT :k
+            """
+        )
 
-    try:
-        with open(json_input_file, "r", encoding="utf-8") as f:
-            docs_from_json = json.load(f)
-        logger.info(f"Loaded {len(docs_from_json)} documents from {json_input_file}")
+        rows = await db_query(sql.text, {"q": query_emb, "k": k})
 
-        for doc_dict in docs_from_json:
-            documents_to_add.append(
-                Document(
-                    page_content=doc_dict.get("page_content", ""),
-                    metadata=doc_dict.get("metadata", {})
-                )
-            )
-    except FileNotFoundError:
-        logger.error(f"'{json_input_file}' not found. Run the orchestrator first.")
-        exit()
-    except Exception as e:
-        logger.error(f"Error loading/parsing {json_input_file}: {e}")
-        exit()
+        docs: List[Document] = []
+        for content, metadata, distance in rows:
+            try:
+                meta = json.loads(metadata) if isinstance(metadata, str) else metadata
+            except Exception:
+                meta = {}
+            m = dict(meta or {})
+            m["score"] = float(distance)
+            docs.append(Document(page_content=content, metadata=m))
 
-    manager = VectorStoreManager()
-    manager.clear_store()
-    asyncio.run(manager.add_documents(documents_to_add))
-
-    print("\n--- 1. Search for 'SonarQube features' ---")
-    results1 = manager.search("What are the key features and pricing for SonarQube?")
-    for doc in results1:
-        print(f"  > CHUNK: {doc.page_content[:]}...")
-        print(f"  > SOURCE: {doc.metadata.get('source', 'N/A')}\n")
-
-    print("--- 2. Search for 'developer pain points' ---")
-    results2 = manager.search("What pain points do developers have?")
-    for doc in results2:
-        print(f"  > CHUNK: {doc.page_content[:]}...")
-        print(f"  > SOURCE: {doc.metadata.get('source', 'N/A')}\n")
+        logger.info(f"✅ Retrieved {len(docs)} chunks from vector store.")
+        return docs

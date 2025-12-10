@@ -1,48 +1,49 @@
+# core/reranker.py
 """
-reranker.py
------------
-Re-ranks retrieved documents by semantic relevance to query.
+Reranker
+--------
+Re-ranks retrieved documents by semantic relevance to a query
+using Gemini with strict JSON output.
 """
 
-import os
 import json
 import re
-from typing import List, Dict, Any
-from loguru import logger
-from langchain_core.documents import Document
-from langchain_google_genai import ChatGoogleGenerativeAI
-from app.config import config
+from typing import Any, Dict, List
 
-# Load Gemini key safely
-if getattr(config, "GEMINI_API_KEY6", None):
-    os.environ["GOOGLE_API_KEY"] = config.GEMINI_API_KEY6
+from loguru import logger
+
+from core.llm import llm_generate
+from core.types import Document
 
 
 class Reranker:
-    def __init__(self, temperature: float = 0.3):
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            temperature=temperature,
-            max_tokens=None,
-            timeout=120,
-            max_retries=2,
-        )
-        logger.info("✅ Gemini reranker initialized (manual JSON parsing mode).")
+    def __init__(self, model: str = None, temperature: float = 0.2):
+        from app.config import settings
 
-    def rerank(self, query: str, docs: List[Document], top_k: int = 5) -> List[Dict[str, Any]]:
+        self.model = model or settings.gemini_model
+        self.temperature = temperature
+        logger.info(f"🔄 Reranker initialized with model={self.model}")
+
+    async def rerank(self, query: str, docs: List[Document], top_k: int = 5) -> List[Dict[str, Any]]:
         if not docs:
-            logger.warning("No documents provided for reranking.")
+            logger.warning("No documents provided to rerank.")
             return []
 
-        texts = [d.page_content[:500] for d in docs[:10]]
-        logger.info(f"🔎 Reranking {len(texts)} documents for query: {query}")
+        # Limit # & length to control token usage
+        texts = [d.page_content[:600] for d in docs[:10]]
+
+        logger.info(f"🔍 Reranking {len(texts)} docs for query: {query!r}")
 
         prompt = f"""
-You are a ranking assistant. Rank these text chunks by how relevant they are to the query.
+You are a relevance ranking system.
 
-Output ONLY valid JSON in this exact format:
+Given a user query and a list of text chunks, rank the chunks by relevance.
+
+⚠️ IMPORTANT: Output ONLY valid JSON. No explanation.
+
+Format:
 [
-  {{ "text": "chunk content...", "score": 92 }},
+  {{ "text": "<chunk text>", "score": <0-100> }},
   ...
 ]
 
@@ -54,48 +55,39 @@ Chunks:
 """
 
         try:
-            response = self.llm.invoke(prompt)
-            raw = getattr(response, "content", "") or str(response)
+            raw = await llm_generate(prompt, model=self.model, temperature=self.temperature)
+            raw = (raw or "").strip()
 
-            # Try clean JSON parsing
+            # Try parsing raw as JSON directly
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError:
-                # Extract JSON from messy text
+                # Try extract JSON array using regex
                 match = re.search(r"\[.*\]", raw, re.DOTALL)
-                if match:
-                    parsed = json.loads(match.group(0))
-                else:
-                    raise ValueError("Could not extract valid JSON")
+                if not match:
+                    raise ValueError("No JSON array found in model output.")
+                parsed = json.loads(match.group(0))
 
-            # Normalize
-            reranked = []
+            reranked: List[Dict[str, Any]] = []
             for item in parsed:
-                if isinstance(item, dict) and "text" in item and "score" in item:
-                    reranked.append({
-                        "text": item["text"],
-                        "score": float(item["score"])
-                    })
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                score = item.get("score")
+                if text is None or score is None:
+                    continue
+                reranked.append({"text": text, "score": float(score)})
 
             if not reranked:
-                raise ValueError("Empty reranked list")
+                raise ValueError("Empty reranked list after parsing.")
 
-            sorted_ranks = sorted(reranked, key=lambda x: x["score"], reverse=True)
-            logger.info("✅ Successfully reranked results.")
-            return sorted_ranks[:top_k]
+            reranked_sorted = sorted(reranked, key=lambda x: x["score"], reverse=True)
+            logger.info("✅ Reranking complete.")
+            return reranked_sorted[:top_k]
 
         except Exception as e:
             logger.error(f"❌ Reranker failed: {e}")
-            return [{"text": d.page_content, "score": 50} for d in docs[:top_k]]
+            logger.warning("Returning fallback equal scores.")
 
-
-# Quick local test
-if __name__ == "__main__":
-    from core.retriever_selector import RetrieverSelector
-    retriever = RetrieverSelector()
-    reranker = Reranker()
-    query = "What are the competitors of SonarQube?"
-    docs = retriever.retrieve(query)
-    ranked = reranker.rerank(query, docs, 5)
-    for r in ranked:
-        print(f"{r['score']:.1f}: {r['text'][:120]}...\n")
+            # Fallback → preserve original order with flat score
+            return [{"text": d.page_content, "score": 50.0} for d in docs[:top_k]]

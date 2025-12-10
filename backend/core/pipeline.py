@@ -1,373 +1,118 @@
+# core/pipeline.py
 """
-pipeline.py
-------------
-Unified pipeline for the Agentic Startup Research Assistant:
-1️⃣ Intent Parsing
-2️⃣ Dynamic Task Planning
-3️⃣ Orchestration & Multi-Agent Research
-4️⃣ RAG Index Building (raw docs)
-5️⃣ Strategy Generation
-6️⃣ Final Report Assembly
-7️⃣ Strategic Knowledge Indexing
-8️⃣ Interactive Chatbot (optional, at end)
+core/pipeline.py
+----------------
+Unified pipeline entrypoint around the LangGraph agent_graph.
+
+Used by FastAPI route to:
+ - Run the graph
+ - Persist useful artifacts
+ - Optionally save into Neon DB
 """
 
+import asyncio
 import json
-
-import requests
-from loguru import logger
 from pathlib import Path
-import traceback
+from typing import Any, Dict
 
-# === Import each stage ===
-from core.intent_parser import IntentParser
-from core.dynamic_task_planner import DynamicTaskPlanner
-from core.orchestrator import app  # Graph-based orchestrator already compiled
-from core.rag_manager import VectorStoreManager
-from langchain_core.documents import Document
-from core.strategy_engine import generate_strategy
-from core.report_builder import build_final_report
-from core.index_strategic_knowledge import load_texts, _normalize_to_text
-from core.chat_bot import ChatMemory, answer_query
+from loguru import logger
+
+from graph.graph_builder import agent_graph
+from core.types import Document
+from infra.memory_store import save_text, save_json
+from infra.db import save_pipeline_result
 
 
-# ===========================================================
-# 🚀 Stage 1: Intent Parsing
-# ===========================================================
-# ===========================================================
-# 🚀 Stage 1: Intent Parsing
-# ===========================================================
-def run_intent_parser(user_query: str):
-    try:
-        logger.info("🧩 [1] Running Intent Parser...")
-        parser = IntentParser()
-        intent = parser.parse(user_query)
-        logger.success("✅ Intent Parser completed.")
-        return intent
-    except Exception as e:
-        logger.error(f"❌ Intent Parser failed: {e}")
-        traceback.print_exc()
-        return None
+DATA_DIR = Path("data")
+RAW_DOCS_DIR = DATA_DIR / "raw_docs"
+RAW_DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+async def run_pipeline(user_query: str) -> Dict[str, Any]:
+    """
+    Async pipeline entrypoint.
 
-# ===========================================================
-# 🧩 Stage 2: Dynamic Task Planner
-# ===========================================================
-def run_task_planner(intent):
-    try:
-        logger.info("🧠 [2] Running Dynamic Task Planner...")
-        planner = DynamicTaskPlanner(use_llm=True)
-        result = planner.plan({"intent": intent})
-        task_plan = result.get("task_plan")
-        logger.success("✅ Task Planner completed.")
-        return task_plan
-    except Exception as e:
-        logger.error(f"❌ Dynamic Task Planner failed: {e}")
-        traceback.print_exc()
-        return None
-
-
-# ===========================================================
-# 🧩 Stage 3: Orchestrator Execution
-# ===========================================================
-def run_orchestrator(task_plan):
-    try:
-        logger.info("🤖 [3] Running Multi-Agent Orchestrator...")
-        inputs = {
-            "plan": task_plan,
-            "completed_tasks": set(),
-            "raw_documents": [],
-            "agent_summaries": [],
-            "final_report": ""
+    Returns:
+        {
+          "status": "success" | "error",
+          "intent": ...,
+          "summary": ...,
+          "final_report": ...,
+          "agent_outputs": ...,
+          "retrieved_docs": ...,
+          "state": ...
         }
-        final_state = app.invoke(inputs, {"recursion_limit": 15})
+    """
+    logger.info("🚀 [PIPELINE] Starting pipeline for query: %s", user_query)
 
+    try:
+        initial_state = {"user_input": user_query}
+
+        final_state = await agent_graph.ainvoke(initial_state)
         if not final_state:
-            raise RuntimeError("No final state returned by orchestrator.")
+            raise RuntimeError("Graph returned empty state")
 
-        # Save agent summaries
-        agent_summaries = final_state.get("agent_summaries", [])
-        Path("data/memory_store").mkdir(parents=True, exist_ok=True)
-        with open("data/memory_store/agent_summaries.json", "w", encoding="utf-8") as f:
-            json.dump(agent_summaries, f, indent=2, ensure_ascii=False)
+        intent = final_state.get("intent")
+        summary = final_state.get("summary")
+        final_report = final_state.get("final_report")
+        agent_outputs = final_state.get("agent_outputs", [])
+        retrieved_docs = final_state.get("retrieved_docs", [])
 
-        # Save raw documents
-        raw_docs = []
-        for d in final_state.get("raw_documents", []):
-            raw_docs.append({
-                "page_content": getattr(d, "page_content", ""),
-                "metadata": getattr(d, "metadata", {})
-            })
-        Path("data/raw_docs").mkdir(parents=True, exist_ok=True)
-        with open("data/raw_docs/raw_docs.json", "w", encoding="utf-8") as f:
-            json.dump(raw_docs, f, indent=2, ensure_ascii=False)
+        # Convert Document objects → JSONable dicts
+        raw_docs_json = []
+        for d in retrieved_docs:
+            if isinstance(d, Document):
+                raw_docs_json.append(
+                    {
+                        "page_content": d.page_content,
+                        "metadata": d.metadata,
+                    }
+                )
+            elif isinstance(d, dict):
+                raw_docs_json.append(d)
 
-        logger.success(f"✅ Orchestrator finished — {len(agent_summaries)} summaries, {len(raw_docs)} docs.")
-        return {"summaries": agent_summaries, "raw_docs": raw_docs}
-
-    except Exception as e:
-        logger.error(f"❌ Orchestrator failed: {e}")
-        traceback.print_exc()
-        return None
-
-
-# ===========================================================
-# 🧩 Stage 4: RAG Manager (index raw docs)
-# ===========================================================
-def run_rag_indexer():
-    try:
-        logger.info("📚 [4] Building initial RAG index from raw documents...")
-        json_input_file = "data/raw_docs/raw_docs.json"
-        with open(json_input_file, "r", encoding="utf-8") as f:
-            docs_json = json.load(f)
-        documents = [Document(page_content=d["page_content"], metadata=d["metadata"]) for d in docs_json]
-
-        manager = VectorStoreManager()
-        manager.clear_store()
-        manager.add_documents(documents)
-
-        logger.success("✅ RAG vector store built from raw_docs.")
-        return True
-    except Exception as e:
-        logger.error(f"❌ RAG Manager failed: {e}")
-        traceback.print_exc()
-        return False
-
-
-# ===========================================================
-# 🧩 Stage 5: Strategy Engine
-# ===========================================================
-def run_strategy_engine():
-    try:
-        logger.info("🎯 [5] Running Strategy Engine (RAG synthesis)...")
-        strategy = generate_strategy(
-            agent_summaries_path="data/memory_store/agent_summaries.json",
-            raw_docs_query="AI-powered GitHub repository analysis tools and developer productivity trends",
-            use_rag=True,
+        # Save raw docs file for debugging / offline analysis
+        raw_docs_path = RAW_DOCS_DIR / "raw_docs.json"
+        raw_docs_path.write_text(
+            json.dumps(raw_docs_json, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        logger.success("✅ Strategy Engine completed.")
-        return strategy
-    except Exception as e:
-        logger.error(f"❌ Strategy Engine failed: {e}")
-        traceback.print_exc()
-        return None
 
+        # Save final report & state into memory_store
+        if final_report:
+            save_text("final_report", final_report)
+        save_json("last_intent", intent or {})
+        save_json("last_agent_outputs", agent_outputs)
+        save_json("last_state", final_state)
 
-# ===========================================================
-# 🧩 Stage 6: Final Report Builder
-# ===========================================================
-def run_report_builder():
-    try:
-        logger.info("📝 [6] Running Report Builder...")
-        result = build_final_report()
-        logger.success("✅ Final Report Builder completed.")
-        return result
-    except Exception as e:
-        logger.error(f"❌ Report Builder failed: {e}")
-        traceback.print_exc()
-        return None
-
-
-# ===========================================================
-# 🧩 Stage 7: Strategic Knowledge Indexer
-# ===========================================================
-def run_strategic_indexer():
-    try:
-        logger.info("📘 [7] Indexing strategic documents (without overwriting existing data)...")
-        from core.index_strategic_knowledge import FILES_TO_INDEX
-        from core.rag_manager import VectorStoreManager
-
-        docs = load_texts()
-        if not docs:
-            logger.warning("No new docs found for strategic index.")
-            return False
-
-        manager = VectorStoreManager()
-        db = manager._get_db()
-
-        existing_sources = set()
+        # Save to Neon DB
         try:
-            collection = db.get(include=["metadatas"])
-            if "metadatas" in collection:
-                for meta in collection["metadatas"]:
-                    if isinstance(meta, dict) and meta.get("source"):
-                        existing_sources.add(meta["source"])
+            if final_report is not None:
+                await save_pipeline_result(
+                    idea=user_query,
+                    intent=intent or {},
+                    strategy={"agent_outputs": agent_outputs},
+                    report_md=final_report,
+                )
         except Exception as e:
-            logger.warning(f"Could not fetch existing metadatas: {e}")
+            logger.error(f"⚠️ Failed to persist pipeline result in Neon: {e}")
 
-        new_docs = [d for d in docs if d.metadata.get("source") not in existing_sources]
-        if not new_docs:
-            logger.info("No new strategy docs — index already up to date.")
-        else:
-            manager.add_documents(new_docs)
-            logger.success(f"✅ Added {len(new_docs)} new strategy docs.")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Strategic Indexer failed: {e}")
-        traceback.print_exc()
-        return False
-
-
-# ===========================================================
-# 🧩 Stage 8: Chatbot Demo (optional)
-# ===========================================================
-def run_chatbot():
-    try:
-        logger.info("💬 [8] Launching Chatbot (context-aware RAG)...")
-        memory = ChatMemory("user_1")
-        print("\n🤖 Chatbot ready! Type 'exit' to stop.\n")
-        while True:
-            q = input("🧍 You: ").strip()
-            if q.lower() in ["exit", "quit"]:
-                print("\n👋 Goodbye!\n")
-                break
-            response = answer_query("user_1", q, memory)
-            print(f"\n🤖 Bot: {response['answer']}\n")
-    except Exception as e:
-        logger.error(f"❌ Chatbot failed: {e}")
-        traceback.print_exc()
-
-
-# ===========================================================
-# 🚦 Main Orchestrated Pipeline Runner
-# ===========================================================
-if __name__ == "__main__":
-    memory_file = Path("data/memory_store/user_1_chat_memory.json")
-    if memory_file.exists():
-        try:
-            memory_file.unlink()  # deletes the file
-            print(f"🗑️ Old chat memory deleted: {memory_file}")
-        except Exception as e:
-            print(f"❌ Could not delete chat memory: {e}")
-    
-    logger.info("🚀 Starting Full Agentic Research Pipeline...\n")
-    user_query = ( "Create AI-driven fitness apps which tracks user health and his dialy activities " "and give healthy insights to maintain a good lifestyle. " "both physical and mental health." )
-    if not user_query:
-        logger.error("No query provided. Exiting.")
-        exit()
-
-    # 1️⃣ Intent Parsing
-    intent = run_intent_parser(user_query)
-    if not intent: exit()
-
-    # 2️⃣ Task Planning
-    plan = run_task_planner(intent)
-    if not plan: exit()
-
-    # 3️⃣ Multi-Agent Orchestrator
-    orch = run_orchestrator(plan)
-    if not orch: exit()
-
-    # 4️⃣ RAG Indexer
-    if not run_rag_indexer(): exit()
-
-    # 5️⃣ Strategy Engine
-    strategy = run_strategy_engine()
-    if not strategy: exit()
-
-    # 6️⃣ Report Builder
-    report = run_report_builder()
-    if not report: exit()
-
-    # 7️⃣ Index Strategic Knowledge
-    run_strategic_indexer()
-
-    # 8️⃣ Chatbot (manual interaction)
-    run_chatbot()
-
-
-# ===========================================================
-# 🧩 Reusable API Entry Point
-# ===========================================================
-def run_pipeline(user_query: str):
-    """
-    Runs the full pipeline programmatically.
-    Safe for FastAPI calls (no CLI interactions).
-    Returns collected results as a dict.
-    """
-    logger.info("🚀 [API] Starting Agentic Research Pipeline...")
-
-    output = {}
-    try:
-        # Delete previous chat memory (optional, per user)
-        memory_file = Path("data/memory_store/user_1_chat_memory.json")
-        if memory_file.exists():
-            try:
-                memory_file.unlink()
-                logger.info(f"🗑️ Old chat memory deleted: {memory_file}")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not delete chat memory: {e}")
-
-        # 1️⃣ Intent Parsing
-        intent = run_intent_parser(user_query)
-        output["intent"] = intent
-        if not intent:
-            return {"error": "Intent parsing failed"}
-
-        # 2️⃣ Dynamic Task Planning
-        plan = run_task_planner(intent)
-        output["plan"] = plan
-        if not plan:
-            return {"error": "Task planning failed"}
-
-        # 3️⃣ Multi-Agent Orchestrator
-        orch = run_orchestrator(plan)
-        output["orchestrator"] = orch
-        if not orch:
-            return {"error": "Orchestrator failed"}
-
-        # 4️⃣ RAG Indexer
-        rag = run_rag_indexer()
-        output["rag_indexed"] = rag
-        if not rag:
-            return {"error": "RAG indexer failed"}
-
-        # 5️⃣ Strategy Engine
-        strategy = run_strategy_engine()
-        output["strategy"] = strategy
-        if not strategy:
-            return {"error": "Strategy engine failed"}
-
-        # 6️⃣ Report Builder
-        report = run_report_builder()
-        output["report"] = report
-        if not report:
-            return {"error": "Report builder failed"}
-
-        # 7️⃣ Strategic Indexing
-        indexing_status = run_strategic_indexer()
-        output["strategic_indexing"] = indexing_status
-
-        logger.success("✅ [API] Pipeline completed successfully.")
-        
-        # Save outputs locally
-        final_output = {
+        result: Dict[str, Any] = {
             "status": "success",
-            "result": output
+            "intent": intent,
+            "summary": summary,
+            "final_report": final_report,
+            "agent_outputs": agent_outputs,
+            "retrieved_docs": raw_docs_json,
+            "state": final_state,
         }
 
-        # ✅ Send results to Neon via frontend route
-        try:
-            with open("data/memory_store/final_report.md", "r") as f:
-                report_md = f.read()
-
-            requests.post(
-                "http://localhost:3000/api/save-report",
-                json={
-                    "idea": user_query,
-                    "resultJson": output,
-                    "reportMd": report_md
-                },
-                timeout=10
-            )
-            logger.info("📤 Saved pipeline results to Neon DB.")
-        except Exception as e:
-            logger.error(f"⚠️ Failed to save results to Neon DB: {e}")
-
-        return final_output
+        logger.info("✅ [PIPELINE] Completed successfully.")
+        return result
 
     except Exception as e:
-        logger.error(f"❌ Pipeline failed: {e}")
-        traceback.print_exc()
-        return {"status": "error", "message": str(e)}
+        logger.error(f"❌ [PIPELINE] Failed: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+        }
