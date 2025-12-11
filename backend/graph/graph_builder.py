@@ -27,6 +27,11 @@ def _build_graph():
     graph.add_edge("rag", "report")
     graph.add_edge("report", END)
 
+    # graph.set_entry_point("intent")
+    # graph.add_edge("intent", "planner")
+    # graph.add_edge("planner", "agents")x
+    # graph.add_edge("agents", END)
+
     return graph.compile()
 
 

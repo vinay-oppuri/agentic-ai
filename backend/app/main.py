@@ -6,6 +6,8 @@ from app.config import settings
 from app.routes.pipeline import router as pipeline_router
 from app.routes.chat import router as chat_router  # if you still use it
 
+from infra.db import init_schema
+
 
 def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name)
@@ -26,6 +28,11 @@ def create_app() -> FastAPI:
 
 app = create_app()
 
+
+
+@app.on_event("startup")
+async def startup_event():
+    await init_schema()   # <-- ADD THIS
 
 @app.get("/")
 def home():

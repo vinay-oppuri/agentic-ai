@@ -4,6 +4,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import tuple_row
 from app.config import settings
 import json
+import asyncio
 
 DATABASE_URL = settings.database_url
 
@@ -11,13 +12,14 @@ if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL missing from .env")
 
 
-# -----------------------------
-# Create a fresh connection each time
-# -----------------------------
+# ----------------------------------------------------
+# Connection helper
+# ----------------------------------------------------
 async def get_conn():
     """
     Opens a new async connection to Neon.
-    Pooling is disabled to avoid SSL/channel binding issues.
+    We do NOT use pooling because Neon idle timeout
+    can break long-lived pooled connections.
     """
     try:
         conn = await AsyncConnection.connect(
@@ -30,9 +32,68 @@ async def get_conn():
         raise e
 
 
-# -----------------------------
-# Execute (INSERT / UPDATE / DELETE)
-# -----------------------------
+# ----------------------------------------------------
+# Initialize schema (AUTO-MIGRATION)
+# ----------------------------------------------------
+async def init_schema():
+    """
+    Ensures that required tables & columns exist.
+    Handles pgvector and missing 'embedding' column.
+    """
+
+    # enable pgvector extension
+    enable_vector = """
+    CREATE EXTENSION IF NOT EXISTS vector;
+    """
+
+    # create table if missing
+    create_table = """
+    CREATE TABLE IF NOT EXISTS document_chunks (
+        id SERIAL PRIMARY KEY,
+        doc_id TEXT,
+        content TEXT,
+        metadata JSONB,
+        embedding vector(3072),
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """
+
+    # add missing embedding column (if table exists but older schema)
+    add_embedding_column = """
+    ALTER TABLE document_chunks
+    ADD COLUMN IF NOT EXISTS embedding vector(3072);
+    """
+
+    create_pipeline_results = """
+    CREATE TABLE IF NOT EXISTS pipeline_results (
+        id SERIAL PRIMARY KEY,
+        idea TEXT,
+        intent_json JSONB,
+        strategy_json JSONB,
+        report_md TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """
+
+    try:
+        conn = await get_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(enable_vector)
+            await cur.execute(create_table)
+            await cur.execute(add_embedding_column)
+            await cur.execute(create_pipeline_results)
+
+        await conn.close()
+        logger.info("🛠️ Database schema initialized + auto-migrated.")
+
+    except Exception as e:
+        logger.error(f"❌ Schema init failed: {e}")
+        raise e
+
+
+# ----------------------------------------------------
+# Execute query (INSERT / UPDATE / DELETE)
+# ----------------------------------------------------
 async def db_execute(sql: str, params=None):
     params = params or []
 
@@ -47,9 +108,9 @@ async def db_execute(sql: str, params=None):
         raise e
 
 
-# -----------------------------
-# Query (SELECT)
-# -----------------------------
+# ----------------------------------------------------
+# Query rows (SELECT)
+# ----------------------------------------------------
 async def db_query(sql: str, params=None):
     params = params or []
 
@@ -67,9 +128,9 @@ async def db_query(sql: str, params=None):
         raise e
 
 
-# -----------------------------
-# Save pipeline results
-# -----------------------------
+# ----------------------------------------------------
+# Save full pipeline result
+# ----------------------------------------------------
 async def save_pipeline_result(idea: str, intent: dict, strategy: dict, report_md: str):
     sql = """
     INSERT INTO pipeline_results (idea, intent_json, strategy_json, report_md)
@@ -84,13 +145,17 @@ async def save_pipeline_result(idea: str, intent: dict, strategy: dict, report_m
         report_md,
     ]
 
-    rows = await db_query(sql, params)
-    return rows[0][0] if rows else None
+    try:
+        rows = await db_query(sql, params)
+        return rows[0][0] if rows else None
+    except Exception as e:
+        logger.error(f"❌ Failed to save pipeline result: {e}")
+        raise e
 
 
-# -----------------------------
-# Optional: test connection
-# -----------------------------
+# ----------------------------------------------------
+# Optional manual test
+# ----------------------------------------------------
 async def test_connection():
     try:
         rows = await db_query("SELECT 1;")

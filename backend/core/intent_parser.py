@@ -103,7 +103,7 @@ Ensure the JSON is clean and valid.
         """
 
         response = client.models.generate_content(
-            model=settings.gemini_model,
+            model="gemini-2.5-flash",
             contents=prompt
         )
 

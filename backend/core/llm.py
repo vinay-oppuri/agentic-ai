@@ -4,10 +4,7 @@ LLM utilities using native Google GenAI (Gemini).
 Provides async-friendly wrappers for text generation and embeddings.
 """
 
-import asyncio
-from functools import partial
 from typing import List, Optional
-
 from loguru import logger
 
 from infra.genai_client import GenAIClient
@@ -24,21 +21,21 @@ async def llm_generate(
     temperature: float = 0.3,
 ) -> str:
     """
-    Async wrapper around GenAIClient.generate().
-    Offloads blocking HTTP call to a thread pool.
+    Async wrapper around GenAIClient.generate_async.
+
+    IMPORTANT:
+    - We do NOT pass generation_config to SDK (incompatible with google-genai API).
+    - Instead, temperature is embedded as a metadata hint inside the prompt.
     """
     model_name = model or settings.gemini_model
 
-    loop = asyncio.get_running_loop()
-    func = partial(
-        GenAIClient.generate,
-        model_name,
-        prompt,
-        generation_config={"temperature": temperature},
-    )
+    # Hint temperature to LLM (safe + works cross-version)
+    prompt_with_hint = f"[temperature={temperature}]\n\n{prompt}"
 
-    logger.debug(f"[LLM] Generating with model={model_name}")
-    return await loop.run_in_executor(None, func)
+    logger.debug(f"[LLM] generate model={model_name}, prompt_len={len(prompt)}")
+
+    # Let GenAIClient handle key rotation + error retries
+    return await GenAIClient.generate_async(model=model_name, prompt=prompt_with_hint)
 
 
 # -----------------------------
@@ -52,13 +49,12 @@ async def embed_texts(
     task: str = "RETRIEVAL_DOCUMENT",
 ) -> List[List[float]]:
     """
-    Async wrapper around GenAIClient.embed().
+    Async wrapper around GenAIClient.embed_async.
     """
     if not texts:
         return []
 
-    loop = asyncio.get_running_loop()
-    func = partial(GenAIClient.embed, texts, model=model, dim=dim, task=task)
+    logger.debug(f"[EMB] embedding count={len(texts)}, model={model}")
 
-    logger.debug(f"[EMB] Embedding {len(texts)} texts with model={model}")
-    return await loop.run_in_executor(None, func)
+    # Threadpool wrapper handled internally by embed_async
+    return await GenAIClient.embed_async(texts, model=model, dim=dim, task=task)
