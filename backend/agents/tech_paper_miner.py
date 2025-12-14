@@ -1,259 +1,249 @@
 # agents/tech_paper_miner.py
 """
-TechPaperMiner Agent (Native GenAI — No LangChain)
---------------------------------------------------
-Collects relevant technical papers using:
- - arXiv API
- - Tavily search
- - Lightweight web scraping
+TechPaperMiner Agent
+--------------------
+(Hybrid "Smart Collector") Agent that finds and returns technical papers.
+Returns BOTH a final JSON summary AND the raw documents for RAG.
 
-Then asks Gemini to:
- - Extract a clean list of structured papers (title, authors, summary, key findings)
- - Produce JSON output compatible with the report builder
-
-Returns BOTH:
- - structured summary
- - raw documents for RAG
+- Fetches data from:
+    • arXiv API (for pre-prints and papers)
+    • Tavily Search (for blogs, news, and other papers)
+    • Web Scraper (to get text from non-arXiv links)
+- Uses Gemini (Native SDK) to plan collection AND summarize.
 """
 
 import json
-import re
-import requests
+import asyncio
 import arxiv
-from typing import Any, Dict, List
+from typing import Dict, Any, List, Optional
 from loguru import logger
-# from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
 
+from google.genai import types
 from infra.genai_client import GenAIClient
 from app.config import settings
+from core.utils import scrape_url, web_search
+from core.types import Document
 
-import requests
-import xml.etree.ElementTree as ET
 
-# --------------------------------------------------------------------
-# Utility: JSON extraction
-# --------------------------------------------------------------------
-def _extract_json_list(text: str) -> List[Dict[str, Any]]:
-    if not text:
-        return []
-    text = text.strip()
+# ----------------------------------------------------------
+# Define the Structured Output Shape
+# ----------------------------------------------------------
 
-    # Direct parse
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list):
-            return parsed
-    except:
-        pass
+class PaperItem(BaseModel):
+    """Details of a single research paper."""
+    title: str = Field(..., description="The full title of the paper.")
+    authors: List[str] = Field(..., description="A list of the primary authors' names.")
+    summary: str = Field(..., description="The paper's abstract or a concise summary.")
+    source_url: str = Field(..., description="The URL to the paper's abstract page or PDF.")
+    key_findings: List[str] = Field(..., description="A 2-3 bullet point list of the paper's key findings.")
 
-    # Extract `[ ... ]`
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if m:
+class PaperList(BaseModel):
+    """A list of relevant technical papers. This is the REQUIRED format for the final summary."""
+    papers: List[PaperItem]
+
+
+# ----------------------------------------------------------
+# Tech Paper Miner Agent (Native Implementation)
+# ----------------------------------------------------------
+
+class TechPaperMinerAgent:
+    def __init__(self):
+        self.client = GenAIClient._make_client(api_key=settings.google_key_paper)
+        self.model_name = settings.gemini_model
+
+    def _arxiv_search(self, query: str, max_results: int = 3) -> str:
+        """Search the arXiv pre-print server for technical papers."""
         try:
-            parsed = json.loads(m.group(0))
-            if isinstance(parsed, list):
-                return parsed
-        except:
-            pass
+            client = arxiv.Client()
+            search = arxiv.Search(
+                query=query,
+                max_results=max_results,
+                sort_by=arxiv.SortCriterion.Relevance
+            )
+            
+            papers = []
+            for result in client.results(search):
+                papers.append({
+                    "title": result.title,
+                    "summary": result.summary,
+                    "authors": [author.name for author in result.authors],
+                    "pdf_url": result.pdf_url,
+                    "published_date": str(result.published.date())
+                })
+            
+            return json.dumps(papers, indent=2)
+        except Exception as e:
+            logger.warning(f"arXiv search failed: {e}")
+            return f"arXiv search failed: {e}"
 
-    logger.warning("[TechPaperMiner] Failed to parse JSON list")
-    return []
+    async def _tavily_search(self, query: str, num_results: int = 5) -> str:
+        """Search the web for research blogs, news, and non-arXiv papers."""
+        try:
+            results = await web_search(query, num_results)
+            return json.dumps(results, indent=2)
+        except Exception as e:
+            logger.warning(f"Tavily search failed: {e}")
+            return f"Tavily search failed: {e}"
 
+    async def _scrape_website(self, url: str) -> str:
+        """Smarter HTML scraper that extracts clean text from a URL."""
+        try:
+            return await scrape_url(url, max_chars=8000)
+        except Exception as e:
+            return f"Failed to scrape {url}: {e}"
 
-# --------------------------------------------------------------------
-# Simple Tools
-# --------------------------------------------------------------------
+    def _parse_results_to_documents(self, tool_name: str, tool_args: dict, tool_result_string: str) -> List[Document]:
+        """Converts the raw JSON/text output from tools into a list of Document objects."""
+        documents = []
+        try:
+            if tool_name == "arxiv_search":
+                papers = json.loads(tool_result_string)
+                if isinstance(papers, list):
+                    for paper in papers:
+                        content = f"Title: {paper.get('title', '')}\nAuthors: {', '.join(paper.get('authors', []))}\nSummary: {paper.get('summary', '')}"
+                        metadata = {
+                            "source": paper.get('pdf_url', ''),
+                            "title": paper.get('title', ''),
+                            "authors": paper.get('authors', []),
+                            "published_date": paper.get('published_date', ''),
+                            "data_source": "arXiv",
+                            "query": tool_args.get("query", "")
+                        }
+                        documents.append(Document(page_content=content, metadata=metadata))
+            
+            elif tool_name == "tavily_search":
+                results = json.loads(tool_result_string)
+                if isinstance(results, list):
+                    for res in results:
+                        content = res.get('content', '')
+                        metadata = {
+                            "source": res.get('url', ''),
+                            "title": res.get('title', ''),
+                            "data_source": "Tavily",
+                            "query": tool_args.get("query", "")
+                        }
+                        documents.append(Document(page_content=content, metadata=metadata))
+            
+            elif tool_name == "scrape_website":
+                url = tool_args.get("url", "")
+                if not tool_result_string.startswith("Failed to scrape"):
+                    content = tool_result_string
+                    metadata = {
+                        "source": url,
+                        "title": f"Scraped content from {url}",
+                        "data_source": "WebScraper"
+                    }
+                    documents.append(Document(page_content=content, metadata=metadata))
+        
+        except Exception as e:
+            logger.warning(f"Failed to parse tool result for {tool_name}: {e}")
+        
+        return documents
 
-def arxiv_search(query: str, max_results: int = 5):
-    """
-    Native arXiv search using the official Atom feed (NO external library).
-    Returns a list of structured paper metadata.
-    """
-    url = (
-        "http://export.arxiv.org/api/query?"
-        f"search_query=all:{query}&start=0&max_results={max_results}"
-    )
+    async def run(self, task: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+        """Executes paper research and returns BOTH summary and raw docs."""
+        
+        research_task_description = task.get("description") or task.get("topic") or state.get("intent", {}).get("idea", "latest AI research")
+        logger.info(f"🔬 [TechPaperMiner] Mining for: {research_task_description}")
 
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
+        try:
+            collected_documents = []
 
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
+            # PHASE 1: BROAD DISCOVERY (Tavily)
+            logger.info("🌍 [TechPaperMiner] Phase 1: Broad Discovery (Tavily)")
+            tavily_query = f"latest research papers and technical blogs about {research_task_description}"
+            tavily_results_json = await self._tavily_search(tavily_query)
+            collected_documents.extend(
+                self._parse_results_to_documents("tavily_search", {"query": tavily_query}, tavily_results_json)
+            )
 
-        papers = []
-        for entry in root.findall("atom:entry", ns):
-            title = entry.find("atom:title", ns).text.strip()
-            summary = entry.find("atom:summary", ns).text.strip()
+            # PHASE 2: ACADEMIC SEARCH (arXiv)
+            logger.info("📚 [TechPaperMiner] Phase 2: Academic Search (arXiv)")
+            arxiv_query = research_task_description[:300] # arXiv query length limit safety
+            arxiv_results_json = self._arxiv_search(arxiv_query)
+            collected_documents.extend(
+                self._parse_results_to_documents("arxiv_search", {"query": arxiv_query}, arxiv_results_json)
+            )
 
-            authors = [
-                a.find("atom:name", ns).text.strip()
-                for a in entry.findall("atom:author", ns)
-            ]
+            # PHASE 3: SCRAPE DETAILS (from Tavily results)
+            logger.info("🕷️ [TechPaperMiner] Phase 3: Scrape Details")
+            urls_to_scrape = []
+            try:
+                tavily_data = json.loads(tavily_results_json)
+                if isinstance(tavily_data, list):
+                    for item in tavily_data[:2]: # Limit to top 2 non-PDF links
+                        url = item.get("url", "")
+                        if url and not url.endswith(".pdf"):
+                            urls_to_scrape.append(url)
+            except Exception:
+                pass
 
-            pdf_url = ""
-            for link in entry.findall("atom:link", ns):
-                if link.attrib.get("title") == "pdf":
-                    pdf_url = link.attrib["href"]
+            if urls_to_scrape:
+                scrape_tasks = [self._scrape_website(url) for url in urls_to_scrape]
+                scrape_results = await asyncio.gather(*scrape_tasks)
+                for url, res in zip(urls_to_scrape, scrape_results):
+                    collected_documents.extend(
+                        self._parse_results_to_documents("scrape_website", {"url": url}, res)
+                    )
 
-            papers.append({
-                "title": title,
-                "summary": summary,
-                "authors": authors,
-                "pdf_url": pdf_url or "N/A",
-            })
+            # PHASE 4: SUMMARIZE (LLM)
+            logger.info("📝 [TechPaperMiner] Phase 4: Summarize")
+            
+            context_text = ""
+            for doc in collected_documents:
+                context_text += f"Source: {doc.metadata.get('source')}\nTitle: {doc.metadata.get('title')}\nContent: {doc.page_content[:1500]}\n\n"
 
-        return papers
+            prompt = f"""
+            You are an AI research assistant. Your goal is to find key technical papers, articles, and libraries related to:
+            "{research_task_description}"
 
-    except Exception as e:
-        return []
+            RESEARCH DATA:
+            {context_text}
 
+            Analyze the abstracts, snippets, and scraped text.
+            Select the most important 3-5 papers/articles/libraries.
+            Return the result as a JSON object matching the `PaperList` schema.
+            """
 
+            response = await self.client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=PaperList,
+                    temperature=0.3,
+                    max_output_tokens=2048,
+                )
+            )
 
-def tavily_search(query: str, n: int = 5) -> List[Dict[str, Any]]:
-    """Search Tavily for web articles."""
-    api_key = getattr(settings, "TAVILY_API_KEY", None)
-    if not api_key:
-        return []
+            final_json = response.parsed
+            
+            if not final_json:
+                 try:
+                     final_json = PaperList.model_validate_json(response.text)
+                 except:
+                     logger.error("Failed to parse PaperList from LLM response")
+                     return {"success": False, "error": "Failed to parse LLM response"}
 
-    try:
-        resp = requests.post(
-            "https://api.tavily.com/search",
-            json={"api_key": api_key, "query": query, "num_results": n},
-            timeout=12
-        )
-        resp.raise_for_status()
-        items = resp.json().get("results", [])
-        return [
-            {
-                "title": i.get("title", ""),
-                "url": i.get("url", ""),
-                "content": i.get("content", "")
+            final_summary_list = [paper.model_dump() for paper in final_json.papers]
+
+            return {
+                "success": True,
+                "output_summary": final_summary_list,
+                "output_raw_docs": [d.dict() if hasattr(d, 'dict') else d for d in collected_documents],
+                "output_type": "PaperReport",
+                "meta": {"source": "GenAI+Native", "agent": "TechPaperMiner"},
             }
-            for i in items
-        ]
-    except Exception as e:
-        logger.warning(f"[TechPaperMiner] Tavily error: {e}")
-        return []
+
+        except Exception as e:
+            logger.exception("TechPaperMinerAgent failed.")
+            return {"success": False, "error": str(e)}
 
 
-def scrape_website(url: str) -> str:
-    """Lightweight HTML text scraper."""
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-        return text[:8000]
-    except Exception as e:
-        logger.warning(f"[TechPaperMiner] scrape failed {url}: {e}")
-        return ""
-
-
-# --------------------------------------------------------------------
-# MAIN AGENT
-# --------------------------------------------------------------------
+# Wrapper function to maintain interface with graph
 async def tech_paper_miner_agent(query: str) -> Dict[str, Any]:
-    """
-    Returns:
-    {
-        "success": True,
-        "output_summary": [...],
-        "output_raw_docs": [...],
-        "output_type": "PaperReport"
-    }
-    """
-
-    logger.info(f"📚 [TechPaperMiner] Starting for query: {query}")
-
-    raw_docs = []
-
-    # ---------------------------------------------------------
-    # PHASE 1 — BROAD WEB SEARCH
-    # ---------------------------------------------------------
-    logger.info("🌐 Tavily search…")
-    tavily_items = tavily_search(query, 6)
-    raw_docs.append({"type": "tavily", "data": tavily_items})
-
-    # ---------------------------------------------------------
-    # PHASE 2 — ACADEMIC SEARCH
-    # ---------------------------------------------------------
-    logger.info("📄 arXiv search…")
-    arxiv_items = arxiv_search(query, 4)
-    raw_docs.append({"type": "arxiv", "data": arxiv_items})
-
-    # ---------------------------------------------------------
-    # PHASE 3 — SCRAPE WEB PAGES
-    # ---------------------------------------------------------
-    scraped = []
-    for item in tavily_items[:3]:
-        url = item.get("url")
-        if url:
-            scraped_text = scrape_website(url)
-            if scraped_text:
-                scraped.append({"url": url, "text": scraped_text})
-    raw_docs.append({"type": "scraped", "data": scraped})
-
-    # Context blob for LLM
-    context_blob = json.dumps(
-        {
-            "arxiv": arxiv_items,
-            "tavily": tavily_items,
-            "scraped": scraped,
-        },
-        ensure_ascii=False
-    )[:12000]
-
-    # ---------------------------------------------------------
-    # PHASE 4 — Ask Gemini to extract structured papers
-    # ---------------------------------------------------------
-    prompt = f"""
-You are a technical research analyst.
-
-You are given mixed sources of research papers, web articles, and scraped text:
-
-{context_blob}
-
-From this material, extract 3–6 high-value research papers or technical resources.
-
-Return ONLY JSON list:
-
-[
-  {{
-    "title": "Paper title",
-    "authors": ["A", "B"],
-    "source_url": "https://...",
-    "summary": "2–4 sentences",
-    "key_findings": ["finding1", "finding2"]
-  }},
-  ...
-]
-"""
-
-    llm_output = await GenAIClient.generate_async(
-        model=settings.gemini_model,
-        prompt=prompt
-    )
-
-    papers = _extract_json_list(llm_output)
-
-    if not papers:
-        # fallback
-        papers = [
-            {
-                "title": "AI-Assisted Static Code Analysis",
-                "authors": ["Researcher A"],
-                "source_url": "N/A",
-                "summary": f"Fallback summary for {query}.",
-                "key_findings": ["AI helps detect code smells", "LLMs assist static analysis"]
-            }
-        ]
-
-    logger.info(f"📚 [TechPaperMiner] Extracted {len(papers)} papers.")
-
-    return {
-        "success": True,
-        "output_summary": papers,
-        "output_raw_docs": raw_docs,
-        "output_type": "PaperReport",
-        "meta": {"agent": "TechPaperMiner"}
-    }
+    agent = TechPaperMinerAgent()
+    task = {"description": query}
+    state = {"intent": {"idea": query}}
+    return await agent.run(task, state)

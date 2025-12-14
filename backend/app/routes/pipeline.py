@@ -1,4 +1,10 @@
 # app/routes/pipeline.py
+"""
+Pipeline Route
+--------------
+Exposes the main agentic research pipeline via REST API.
+"""
+
 from fastapi import APIRouter, HTTPException
 from loguru import logger
 
@@ -12,11 +18,21 @@ router = APIRouter(tags=["pipeline"])
 @router.post("/pipeline/run", response_model=PipelineResponse)
 async def pipeline_run(req: PipelineRequest):
     """
-    Execute the full agentic pipeline for a given query.
+    Executes the full agentic pipeline for a given query.
+    
+    - Parses intent
+    - Plans research tasks
+    - Runs agents (Competitor, Trends, Papers)
+    - Retrieves context (RAG)
+    - Generates final report
     """
-    logger.info(f"🌐 [API] /pipeline/run called with query: {req.query!r}")
+    logger.info(f"🌐 [API] /pipeline/run called with query: {req.query}")
 
-    result = await run_pipeline(req.query)
+    try:
+        result = await run_pipeline(req.query)
+    except Exception as e:
+        logger.error(f"❌ [API] Pipeline execution failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     if result.get("status") != "success":
         raise HTTPException(status_code=500, detail=result.get("message", "Pipeline failed"))

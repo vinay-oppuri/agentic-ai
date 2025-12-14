@@ -1,12 +1,24 @@
+# app/routes/chat.py
+"""
+Chat Route
+----------
+Simple chat endpoint that invokes the graph directly.
+Useful for debugging or simpler interactions.
+"""
+
 from fastapi import APIRouter, HTTPException
 from api.schemas import ChatRequest, ChatResponse
 from graph.graph_builder import agent_graph
+
 
 router = APIRouter(tags=["chat"])
 
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest) -> ChatResponse:
+    """
+    Directly invokes the agent graph with a user message.
+    """
     try:
         initial_state = {"user_input": req.message}
         result_state = await agent_graph.ainvoke(initial_state)

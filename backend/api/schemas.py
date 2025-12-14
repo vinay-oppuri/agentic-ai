@@ -1,17 +1,26 @@
-from typing import Any, Dict, Optional, List
+# api/schemas.py
+"""
+API Schemas
+-----------
+Pydantic models for request and response validation.
+"""
+
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
 
 # -------------------------
-# Chat API Schema
+# Chat API
 # -------------------------
 
 class ChatRequest(BaseModel):
+    """Request model for simple chat endpoint."""
     message: str
     session_id: Optional[str] = "default"
 
 
 class ChatResponse(BaseModel):
+    """Response model for simple chat endpoint."""
     intent: str
     summary: Optional[str] = None
     report: Optional[str] = None
@@ -19,14 +28,16 @@ class ChatResponse(BaseModel):
 
 
 # -------------------------
-# Pipeline API Schema
+# Pipeline API
 # -------------------------
 
 class PipelineRequest(BaseModel):
+    """Request model for full research pipeline."""
     query: str
 
 
 class PipelineResponse(BaseModel):
+    """Response model for full research pipeline."""
     status: str
     intent: Optional[Dict[str, Any]] = None
     summary: Optional[str] = None

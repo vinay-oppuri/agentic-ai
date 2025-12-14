@@ -1,141 +1,99 @@
 # graph/nodes/planner_node.py
+"""
+Planner Node
+------------
+Generates a dynamic execution plan based on the parsed intent.
+Decides which agents to run and what tasks to perform.
+"""
 
 import json
+from typing import Any, Dict
+
 from loguru import logger
 
 from graph.state import AgentState
-from infra.genai_client import GenAIClient
+from core.llm import llm_generate
+from core.utils import extract_json_object
+from app.config import settings
 
 
 async def planner_node(state: AgentState) -> AgentState:
     """
-    Dynamic Task Planner Node
-    -------------------------
-    Converts parsed intent → task plan (tasks + suggested agents).
-
-    Works with Gemini native SDK (no LangChain).
+    Generates a research plan.
     """
-
     user_input = state.get("user_input", "")
     intent = state.get("intent", {})
 
-    logger.info("[PlannerNode] 🧠 Creating dynamic task plan...")
+    logger.info("🗺️ [PlannerNode] Generating plan...")
 
-    # ----------------------------
-    # BUILD PROMPT
-    # ----------------------------
     prompt = f"""
-You are an intelligent **Dynamic Task Planner** for an Agentic Startup Research Assistant.
+    You are an intelligent **Dynamic Task Planner** for an Agentic Startup Research Assistant.
+    
+    Given the parsed startup intent:
+    {json.dumps(intent, indent=2)}
+    
+    Generate a **pure JSON** object with the following fields:
+    
+    AVAILABLE AGENTS:
+    - CompetitorScout: Finds competitors and analyzes their features.
+    - TrendScraper: Finds latest market trends and news.
+    - TechPaperMiner: Finds technical papers and academic research.
+    
+    Return a JSON object with:
+    {{
+        "plan_steps": ["Step 1...", "Step 2..."],
+        "selected_agents": ["AgentName1", "AgentName2"]
+    }}
+    """
 
-Given the parsed startup intent:
-{json.dumps(intent, indent=2)}
+    try:
+        response = await llm_generate(prompt, temperature=0.3, max_tokens=1024, api_key=settings.google_key_planner)
+        if response.startswith("⚠️"):
+            raise ValueError(response)
+        plan = json.loads(response)
+    except Exception as e:
+        logger.warning(f"⚠️ [PlannerNode] Planning failed: {e}. Using fallback.")
+        plan = _fallback_plan(intent)
 
-Generate a **pure JSON** object with the following fields:
-
-- research_goal: short summary of what needs to be researched
-- suggested_agents: list of agents to invoke next 
-      (choose from: ["CompetitorScout", "TechPaperMiner", "TrendScraper"])
-
-- tasks: a list of max 4 objects with:
-      id, title, description, priority, depends_on, assigned_agent
-
-- expected_outputs: list of expected artifacts (summaries, datasets, etc.)
-
-- reasoning_notes: why these tasks were chosen
-
-⚠️ RULES:
-- Return ONLY JSON.
-- No explanations, no markdown, no code fences.
-"""
-
-    # ----------------------------
-    # CALL GEMINI (async wrapper)
-    # ----------------------------
-    raw = await GenAIClient.generate_async(
-        model="gemini-2.5-flash",
-        prompt=prompt,
-    )
-
-    plan = _safe_parse_plan(raw, intent)
-
-    # Write back to graph state
     return {
         **state,
         "plan": plan,
     }
 
 
-# -------------------------------------------------------
-# HELPERS
-# -------------------------------------------------------
-
-def _safe_parse_plan(raw: str, intent: dict):
-    """
-    Cleans and loads JSON. Falls back to deterministic plan if needed.
-    """
-    try:
-        clean = _extract_json(raw)
-        return json.loads(clean)
-    except Exception as e:
-        logger.warning(f"[PlannerNode] ⚠️ Failed JSON parse: {e}. Using fallback plan.")
-        return _fallback_plan(intent)
-
-
-def _extract_json(text: str) -> str:
-    """Extract JSON object from messy LLM output."""
-    text = text.strip()
-
-    # Remove ```json fences
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start != -1 and end != -1:
-        return text[start:end + 1]
-
-    raise ValueError("No JSON object found in LLM output")
-
-
-def _fallback_plan(intent: dict):
-    """
-    Deterministic fallback plan when Gemini fails or quota exceeded.
-    """
-
-    tech_keywords_raw = intent.get("tech_keywords", [])
-    if isinstance(tech_keywords_raw, str):
-        tech_keywords = [w.strip() for w in tech_keywords_raw.split(",")]
-    else:
-        tech_keywords = tech_keywords_raw
-
+def _fallback_plan(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Generates a deterministic fallback plan."""
+    tech_keywords = intent.get("tech_keywords", [])
+    
     agents = []
-
-    if any(k.lower() in [t.lower() for t in tech_keywords] for k in ["AI", "Machine Learning", "NLP", "LLM"]):
+    # Simple heuristics
+    if any(k.lower() in str(tech_keywords).lower() for k in ["ai", "ml", "llm"]):
         agents.append("TechPaperMiner")
-
+    
     if "competitor" in intent.get("raw_query", "").lower():
         agents.append("CompetitorScout")
-
-    agents.append("TrendScraper")
+        
+    # Always include TrendScraper as fallback
+    if not agents:
+        agents.append("TrendScraper")
+    
+    # Ensure TrendScraper is there if list is short
+    if "TrendScraper" not in agents:
+        agents.append("TrendScraper")
 
     tasks = []
     for i, ag in enumerate(agents, 1):
         tasks.append({
             "id": i,
             "title": f"{ag} Task",
-            "description": f"Execute {ag} to collect insights relevant to the user query.",
+            "description": f"Execute {ag}",
             "priority": i,
-            "depends_on": [],
             "assigned_agent": ag,
         })
 
     return {
-        "research_goal": "Generate initial insights on competitors, trends, and technical feasibility.",
+        "research_goal": "Fallback research plan.",
         "suggested_agents": agents,
         "tasks": tasks,
-        "expected_outputs": ["summaries", "agent_reports", "retrieved_docs"],
-        "reasoning_notes": "Fallback rule-based plan used.",
+        "reasoning_notes": "Fallback used due to planner error."
     }

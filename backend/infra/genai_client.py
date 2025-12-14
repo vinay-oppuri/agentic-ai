@@ -1,139 +1,132 @@
 # infra/genai_client.py
+"""
+GenAI Client Module
+-------------------
+A robust wrapper around the Google GenAI SDK.
+Features:
+- Exponential backoff for rate limits.
+- Safe fallbacks for quota exhaustion.
+- Consistent embedding dimensions.
+- Direct API key support.
+"""
+
 import os
 import time
+from typing import List, Optional
+
 from loguru import logger
 from fastapi.concurrency import run_in_threadpool
 from google import genai
-from infra.key_manager import KeyManager
+from google.genai import types
+
 from app.config import settings
 
 
 class GenAIClient:
     """
-    Enhanced Google GenAI wrapper with:
-    - multi-key rotation
-    - exponential backoff
-    - retry limits
-    - safe fallback
+    Enhanced Google GenAI wrapper.
     """
 
-    # ------------------------------
-    # Retry configuration
-    # ------------------------------
-    max_retries_per_key = 3         # retry a single key this many times
-    max_total_retries = 15          # hard global cap
-    initial_backoff = 1.0           # seconds
-    max_backoff = 12                # cap for exponential backoff
-    soft_fail = True                # do not crash pipeline on quota error
+    # Retry Configuration
+    MAX_RETRIES = 2
+    INITIAL_BACKOFF = 4.0  # seconds
+    MAX_BACKOFF = 20.0     # seconds
 
     @staticmethod
-    def _make_client_for_key(api_key: str):
-        os.environ["GOOGLE_API_KEY"] = api_key  # keep compatibility with older libs
-        return genai.Client(api_key=api_key)
+    def _make_client(api_key: Optional[str] = None) -> genai.Client:
+        """Creates a GenAI client instance."""
+        key = api_key or settings.google_api_key
+        if not key:
+            raise ValueError("No Google API key provided.")
+        
+        # Set env var for compatibility
+        os.environ["GOOGLE_API_KEY"] = key
+        return genai.Client(api_key=key)
 
     @classmethod
-    def _backoff(cls, attempt: int):
-        delay = min(cls.initial_backoff * (2 ** attempt), cls.max_backoff)
-        logger.warning(f"⏳ Backoff {delay:.1f}s before retry…")
+    def _backoff(cls, attempt: int) -> None:
+        """Sleeps for an exponential backoff duration."""
+        delay = min(cls.INITIAL_BACKOFF * (2 ** attempt), cls.MAX_BACKOFF)
+        logger.warning(f"⏳ Backoff {delay:.1f}s before retry...")
         time.sleep(delay)
 
-    # ---------------------------------------------------------------------
-    # LLM CALL
-    # ---------------------------------------------------------------------
     @classmethod
-    def generate(cls, model: str, prompt: str):
+    def generate(cls, model: str, prompt: str, api_key: Optional[str] = None, **kwargs) -> str:
         """
-        Robust synchronous LLM call:
-        - rotates keys via KeyManager
-        - retries each key
-        - retries globally
-        - exponential backoff
-        - optional soft-fail fallback
+        Generates content using the specified model and prompt.
+        
+        Args:
+            model (str): Model name (e.g., "gemini-2.5-flash").
+            prompt (str): The input prompt.
+            api_key (str, optional): Specific API key to use.
+            **kwargs: Additional config parameters (temperature, max_output_tokens, etc.)
+            
+        Returns:
+            str: The generated text, or a fallback message if retries fail.
         """
-        failures = 0
+        client = cls._make_client(api_key)
 
-        for _ in range(len(KeyManager.keys) * cls.max_retries_per_key):
-            key = KeyManager.next_key()
-            client = cls._make_client_for_key(key)
+        for attempt in range(cls.MAX_RETRIES):
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(**kwargs)
+                )
+                
+                # Extract text safely
+                text = (
+                    getattr(resp, "text", None)
+                    or getattr(resp, "content", None)
+                    or str(resp)
+                )
+                return text
 
-            for attempt in range(cls.max_retries_per_key):
-                try:
-                    resp = client.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                    )
-
-                    text = (
-                        getattr(resp, "text", None)
-                        or getattr(resp, "content", None)
-                        or str(resp)
-                    )
-                    return text
-
-                except Exception as e:
-                    failures += 1
-                    logger.warning(
-                        f"⚠️ LLM error (key={key[:6]}…, attempt={attempt+1}): {e}"
-                    )
-
-                    # stop if too many global failures
-                    if failures >= cls.max_total_retries:
-                        logger.error(
-                            f"❌ LLM hard-stop: exceeded global retry limit ({cls.max_total_retries})."
-                        )
-
-                        if cls.soft_fail:
-                            return (
-                                "⚠️ LLM Quota Exhausted — returning fallback output. "
-                                "Try again later or upgrade Gemini quota."
-                            )
-                        raise e
-
+            except Exception as e:
+                logger.warning(f"⚠️ LLM error (attempt={attempt+1}): {e}")
+                if attempt < cls.MAX_RETRIES - 1:
                     cls._backoff(attempt)
+                else:
+                    logger.error("❌ LLM failed after retries.")
+                    return "⚠️ LLM Error — Request failed."
 
-            logger.warning(f"🔁 Key exhausted → Switching key…")
-
-        # if loop exits without return:
-        if cls.soft_fail:
-            logger.error("💥 All keys failed — returning fallback summary.")
-            return (
-                "⚠️ LLM Quota Exhausted — All API keys failed. "
-                "Please retry later."
-            )
-
-        raise RuntimeError("All Gemini API keys failed.")
+        return "⚠️ LLM Error — Request failed."
 
     @classmethod
-    async def generate_async(cls, model: str, prompt: str):
-        """Async wrapper for FastAPI."""
-        return await run_in_threadpool(cls.generate, model, prompt)
+    async def generate_async(cls, model: str, prompt: str, api_key: Optional[str] = None, **kwargs) -> str:
+        """Async wrapper for generate."""
+        return await run_in_threadpool(cls.generate, model, prompt, api_key, **kwargs)
 
-    # ---------------------------------------------------------------------
-    # EMBEDDING CALL
-    # ---------------------------------------------------------------------
     @classmethod
-    def embed(cls, texts, model="text-embedding-004", dim=3072, task="RETRIEVAL_DOCUMENT"):
+    def embed(cls, texts: List[str], model: str = "text-embedding-004", dim: int = 768, task: str = "RETRIEVAL_DOCUMENT", api_key: Optional[str] = None) -> List[List[float]]:
         """
-        Robust embedding call: safe fallback for errors.
+        Generates embeddings for a list of texts.
         """
-        key = KeyManager.next_key()
-        client = cls._make_client_for_key(key)
+        client = cls._make_client(api_key)
 
-        try:
-            resp = client.models.embed_content(
-                model=model,
-                contents=texts,
-                config=genai.types.EmbedContentConfig(
-                    output_dimensionality=dim,
-                    task_type=task,
-                ),
-            )
-            return [e.values for e in resp.embeddings]
+        for attempt in range(cls.MAX_RETRIES):
+            try:
+                resp = client.models.embed_content(
+                    model=model,
+                    contents=texts,
+                    config=types.EmbedContentConfig(
+                        output_dimensionality=dim,
+                        task_type=task,
+                    ),
+                )
+                return [e.values for e in resp.embeddings]
 
-        except Exception as e:
-            logger.error(f"❌ Embedding failed (key={key[:6]}…): {e}")
-            return [[] for _ in texts]
+            except Exception as e:
+                logger.warning(f"⚠️ Embedding error (attempt={attempt+1}): {e}")
+                if attempt < cls.MAX_RETRIES - 1:
+                    cls._backoff(attempt)
+                else:
+                    logger.error("❌ Embedding failed after retries.")
+                    return [[] for _ in texts]
+        
+        return [[] for _ in texts]
 
     @classmethod
-    async def embed_async(cls, texts, **kwargs):
+    async def embed_async(cls, texts: List[str], **kwargs) -> List[List[float]]:
+        """Async wrapper for embed."""
         return await run_in_threadpool(cls.embed, texts, **kwargs)

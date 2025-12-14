@@ -1,27 +1,38 @@
 # core/rag_manager.py
 """
-Neon + pgvector RAG Manager.
-
-- Chunks documents
-- Embeds with Gemini (text-embedding-004)
-- Stores chunks & embeddings in Neon (document_chunks table)
-- Performs vector similarity search with pgvector
+RAG Manager Module
+------------------
+Manages the retrieval-augmented generation pipeline.
+- Chunks documents.
+- Generates embeddings.
+- Stores chunks in Neon (PostgreSQL) with pgvector.
+- Performs semantic search.
 """
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
-from sqlalchemy import text
 
 from core.llm import embed_texts
 from core.types import Document
 from infra.db import db_execute, db_query
+from app.config import settings
 
 
 def _chunk_text(text: str, chunk_size: int = 1500, overlap: int = 150) -> List[str]:
-    """Simple character-based splitter."""
-    chunks: List[str] = []
+    """
+    Splits text into overlapping chunks.
+    
+    Args:
+        text (str): Input text.
+        chunk_size (int): Max characters per chunk.
+        overlap (int): Overlap characters.
+        
+    Returns:
+        List[str]: List of text chunks.
+    """
+    chunks = []
     start = 0
     n = len(text)
 
@@ -36,8 +47,10 @@ def _chunk_text(text: str, chunk_size: int = 1500, overlap: int = 150) -> List[s
 
 
 def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure metadata is JSON-serializable and flat-ish."""
-    clean: Dict[str, Any] = {}
+    """
+    Ensures metadata values are JSON-serializable.
+    """
+    clean = {}
     for k, v in (metadata or {}).items():
         if isinstance(v, (str, int, float, bool)) or v is None:
             clean[k] = v
@@ -45,7 +58,6 @@ def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
             clean[k] = ", ".join(map(str, v))
         elif isinstance(v, dict):
             clean[k] = json.dumps(v, ensure_ascii=False)
-            # Alternatively: store nested dict as JSON string
         else:
             clean[k] = str(v)
     return clean
@@ -53,105 +65,117 @@ def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 class VectorStoreManager:
     """
-    VectorStoreManager for Neon + pgvector.
-
-    API:
-        await clear_store()
-        await add_documents(documents)
-        await search(query, k=5)
+    Manages vector storage and retrieval using Neon + pgvector.
     """
 
     async def clear_store(self) -> None:
-        logger.warning("🧹 Clearing document_chunks table...")
-        sql = "TRUNCATE document_chunks RESTART IDENTITY;"
-        await db_execute(sql)
+        """Truncates the document_chunks table."""
+        logger.warning("🧹 Clearing vector store...")
+        await db_execute("TRUNCATE document_chunks RESTART IDENTITY;")
         logger.info("✅ Vector store cleared.")
 
     async def add_documents(self, documents: List[Dict[str, Any]]) -> None:
         """
-        documents: list of dicts with keys:
-            - page_content: str
-            - metadata: dict
+        Chunks, embeds, and stores documents.
+        
+        Args:
+            documents (List[Dict]): List of dicts with 'page_content' and 'metadata'.
         """
         if not documents:
-            logger.warning("No documents provided to add to vector store.")
             return
 
-        logger.info(f"📄 Received {len(documents)} documents. Chunking & embedding...")
+        logger.info(f"📄 Processing {len(documents)} documents...")
 
-        # 1) Build chunks
+        # 1. Chunking
         chunks: List[Dict[str, Any]] = []
         for doc in documents:
             text = doc.get("page_content") or ""
             meta = _sanitize_metadata(doc.get("metadata", {}))
-            for chunk in _chunk_text(text):
-                chunks.append({"content": chunk, "metadata": meta})
-
-        logger.info(f"✂️ Split into {len(chunks)} chunks.")
+            for chunk_text in _chunk_text(text):
+                chunks.append({"content": chunk_text, "metadata": meta})
 
         if not chunks:
-            logger.warning("No chunks produced from documents.")
             return
 
-        # 2) Embed in batches
+        logger.info(f"✂️ Created {len(chunks)} chunks.")
+
+        # 2. Embedding & Storage (Batched)
         BATCH_SIZE = 16
+        sql = """
+        INSERT INTO document_chunks (content, metadata, embedding)
+        VALUES (%s, %s, %s)
+        """
+
         for i in range(0, len(chunks), BATCH_SIZE):
             batch = chunks[i : i + BATCH_SIZE]
             texts = [c["content"] for c in batch]
 
             try:
-                embeddings = await embed_texts(texts)
+                embeddings = await embed_texts(texts, api_key=settings.google_key_rag)
             except Exception as e:
-                logger.error(f"Embedding batch {i} failed: {e}")
+                logger.error(f"❌ Embedding batch {i} failed: {e}")
                 continue
 
-            # 3) Insert into Neon
-            sql = """
-            INSERT INTO document_chunks (content, metadata, embedding)
-            VALUES (%s, %s, %s)
-            """
+            # Insert batch
+            for c, emb in zip(batch, embeddings):
+                if not emb: 
+                    continue # Skip failed embeddings
+                
+                await db_execute(sql, [c["content"], json.dumps(c["metadata"]), emb])
 
-            params_list = [
-                (c["content"], json.dumps(c["metadata"]), emb)
-                for c, emb in zip(batch, embeddings)
-            ]
+            logger.info(f"  > Stored chunks {i+1}-{min(i+len(batch), len(chunks))}")
 
-            for params in params_list:
-                await db_execute(sql, list(params))
-
-            logger.info(f"  > Stored chunks {i+1}–{i+len(batch)}/{len(chunks)}")
-
-        logger.info("✅ All chunks stored in Neon.")
+        logger.info("✅ All chunks stored.")
 
     async def search(self, query: str, k: int = 5) -> List[Document]:
         """
-        Vector similarity search using pgvector <-> operator.
-        Returns a list of core.types.Document.
+        Performs semantic search.
+        
+        Args:
+            query (str): The search query.
+            k (int): Number of results to return.
+            
+        Returns:
+            List[Document]: Top k matching documents.
         """
-        logger.info(f"🔍 Vector search for: {query!r}")
+        logger.info(f"🔍 Searching for: {query}")
 
-        [query_emb] = await embed_texts([query])
+        # Generate query embedding
+        embeddings = await embed_texts([query], api_key=settings.google_key_rag)
+        if not embeddings or not embeddings[0]:
+            logger.warning("⚠️ Failed to embed query.")
+            return []
+            
+        query_emb = embeddings[0]
 
-        sql = text(
-            """
-            SELECT content, metadata, embedding <-> :q AS distance
-            FROM document_chunks
-            ORDER BY embedding <-> :q
-            LIMIT :k
-            """
-        )
+        # SQL for cosine similarity (using <-> operator for L2 distance, order by distance ASC)
+        # Note: For cosine similarity with normalized vectors, L2 distance order is same as cosine distance.
+        # pgvector's <-> is L2 distance. <=> is cosine distance. 
+        # text-embedding-004 vectors are normalized, so either works, but <=> is explicit for cosine.
+        # Let's use <=> for cosine distance.
+        
+        sql = """
+        SELECT content, metadata, embedding <=> %s::vector AS distance
+        FROM document_chunks
+        ORDER BY distance ASC
+        LIMIT %s
+        """
 
-        rows = await db_query(sql.text, {"q": query_emb, "k": k})
+        rows = await db_query(sql, [query_emb, k])
 
-        docs: List[Document] = []
+        docs = []
         for content, metadata, distance in rows:
             try:
                 meta = json.loads(metadata) if isinstance(metadata, str) else metadata
             except Exception:
                 meta = {}
-            m = dict(meta or {})
-            m["score"] = float(distance)
-            docs.append(Document(page_content=content, metadata=m))
+            
+            # Convert distance to similarity score (approximate)
+            # Cosine distance = 1 - cosine_similarity
+            # So similarity = 1 - distance
+            meta["score"] = 1.0 - float(distance)
+            
+            docs.append(Document(page_content=content, metadata=meta))
 
-        logger.info(f"✅ Retrieved {len(docs)} chunks from vector store.")
+        logger.info(f"✅ Retrieved {len(docs)} relevant chunks.")
         return docs
